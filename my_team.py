@@ -120,7 +120,6 @@ class ReflexCaptureAgent(CaptureAgent):
         """
         features = self.get_features(game_state, action)
         weights = self.get_weights(game_state, action)
-        print(features*weights)
         return features * weights
 
     def get_features(self, game_state, action):
@@ -271,18 +270,18 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
         defending_food = self.get_food_you_are_defending(successor).as_list()
         closest_food =  min([self.get_maze_distance(my_pos, food) for food in defending_food])
         if len(invaders)>0:
-            features['food_defense'] = 0
-        else:
             features['food_defense'] = closest_food
+        else:
+            features['food_defense'] = 0
 
         # hold the line
         border_line = game_state.data.layout.width // 2
         boundary_x = border_line - 1 if self.red else border_line
         border_distance = abs(my_pos[0] - boundary_x)
         if len(invaders) > 0:
-            features['near_border'] = border_distance
-        else:
             features['near_border'] = 0
+        else:
+            features['near_border'] = border_distance
 
         return features
 
@@ -304,4 +303,3 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
                 'stop': -100, 'reverse': -2,
                 'food_defense': 0,
                 'near_border' : -5}
-
