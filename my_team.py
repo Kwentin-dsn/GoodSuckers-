@@ -21,13 +21,15 @@
 # For more info, see http://inst.eecs.berkeley.edu/~cs188/sp09/pacman.html
 
 import random
-from pyexpat import features
+
+from sympy import false
 
 from contest.capture_agents import CaptureAgent
 from contest.game import Directions
-from nbformat.validator import better_validation_error
+
 import contest.util as util
 from contest.util import nearest_point
+
 
 
 #################
@@ -56,6 +58,13 @@ def create_team(first_index, second_index, is_red,
 ##########
 # Agents #
 ##########
+class TeamData:
+    def __init__(self):
+        self.enemy_pos_offense = {} # last known ghost positions
+        self.enemy_pos_defense = {}
+        self.enemy_scared_timers = {}
+        self.food_eaten_positions = []
+team_communication = TeamData()
 
 class ReflexCaptureAgent(CaptureAgent):
     """
@@ -65,16 +74,106 @@ class ReflexCaptureAgent(CaptureAgent):
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
         self.start = None
+        self.path = []
+        self.path_counter = 0
+        global team_communication
+        self.team_communication = team_communication
+        self.midpoint = None
+
+
+
+    def update_team_data(self, game_state):
+        """Update shared team info"""
+        line_of_defense = self.midpoint - (1 if self.red else 0)
+
+        for enemy_index in self.get_opponents(game_state):
+            enemy_state = game_state.get_agent_state(enemy_index)
+            enemy_pos = enemy_state.get_position()
+
+            if enemy_pos is not None:
+                #Update timer when ghost visible
+                self.team_communication.enemy_scared_timers[enemy_index] = enemy_state.scared_timer
+                # Enemy in defense or not
+                if self.red:
+                    Is_in_defensezone = enemy_pos[0] < line_of_defense
+                else:
+                    Is_in_defensezone = enemy_pos[0] >= line_of_defense
+
+                #Update shared knowledge
+                self.team_communication.enemy_pos_defense[enemy_index] = enemy_pos if Is_in_defensezone else None
+                self.team_communication.enemy_pos_offense[enemy_index] = enemy_pos if not Is_in_defensezone else None
+            else:
+                if self.team_communication.enemy_scared_timers[enemy_index]:
+                    self.team_communication.enemy_scared_timers[enemy_index] -= 1
+                else:
+                    self.team_communication.enemy_scared_timers[enemy_index] = None
+
+
+            if game_state.get_agent_position(enemy_index) ==  game_state.get_agent_state(self.index).get_position():
+                self.team_communication.enemy_pos_offense[enemy_index] = None
+                self.team_communication.enemy_pos_defense[enemy_index] = None
+
+    def optimal_path(self, state):
+        """
+        Returns the optimal path to the closest powerpellet
+        """
+        my_pos = state.get_agent_state(self.index).get_position()
+        pellets = self.get_capsules(state)
+        if not pellets:
+            return []
+
+        min_distance = float('inf')
+        best_pellet = None
+
+        for p in pellets:
+            distance = self.get_maze_distance(my_pos, p)
+            if distance < min_distance:
+                min_distance = distance
+                best_pellet = p
+
+        agenda = util.PriorityQueue()
+        agenda.push((state, [], 0), self.get_maze_distance(my_pos, best_pellet))
+        bezochte_states = []
+
+        while not agenda.is_empty():
+            current = agenda.pop()
+            search_state, path, cost = current
+            if search_state.get_agent_state(self.index).get_position() == best_pellet:
+                return path
+            else:
+                if not (search_state in bezochte_states):
+                    bezochte_states.append(search_state)
+                    new_actions =  search_state.get_legal_actions(self.index)
+                    for a in new_actions:
+                        new_state = self.get_successor(search_state, a)
+                        new_path = path + [(search_state, a)]
+                        new_cost = cost + 1
+                        new_heuristic = new_cost + self.get_maze_distance(new_state.get_agent_state(self.index).get_position(), best_pellet)
+                        agenda.push((new_state, new_path, new_cost), new_heuristic)
+        return []
+
 
     def register_initial_state(self, game_state):
         self.start = game_state.get_agent_position(self.index)
         CaptureAgent.register_initial_state(self, game_state)
+        self.path = self.optimal_path(game_state)
+        self.midpoint = game_state.data.layout.width // 2
+        for i in self.get_opponents(game_state):
+            self.team_communication.enemy_pos_offense[i] = None
+            self.team_communication.enemy_pos_defense[i] = None
+            self.team_communication.enemy_scared_timers[i] = 0
 
     def choose_action(self, game_state):
         """
         Picks among the actions with the highest Q(s,a).
         """
+        self.update_team_data(game_state)
+
         actions = game_state.get_legal_actions(self.index)
+
+        # ignore stop action
+        if Directions.STOP in actions:
+            actions.remove(Directions.STOP)
 
         # You can profile your evaluation time by uncommenting these lines
         # start = time.time()
@@ -84,19 +183,11 @@ class ReflexCaptureAgent(CaptureAgent):
         max_value = max(values)
         best_actions = [a for a, v in zip(actions, values) if v == max_value]
 
-        food_left = len(self.get_food(game_state).as_list())
-
-        if food_left <= 2:
-            best_dist = 9999
-            best_action = None
-            for action in actions:
-                successor = self.get_successor(game_state, action)
-                pos2 = successor.get_agent_position(self.index)
-                dist = self.get_maze_distance(self.start, pos2)
-                if dist < best_dist:
-                    best_action = action
-                    best_dist = dist
-            return best_action
+        if self.path and self.path_counter <= len(self.path):
+            action = self.path[self.path_counter]
+            if action in actions:
+                self.path_counter += 1
+                return action
 
         return random.choice(best_actions)
 
@@ -147,51 +238,109 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
   """
 
     def get_features(self, game_state, action):
+        # create dictionary, get successor state and position, and food list
         features = util.Counter()
         successor = self.get_successor(game_state, action)
         food_list = self.get_food(successor).as_list()
         my_state = successor.get_agent_state(self.index)
         my_pos = successor.get_agent_position(self.index)
-        features['successor_score'] = -len(food_list)  # self.get_score(successor)
+
+        # get successor score depending on team, with the food score
+        features['successor_score'] = self.get_score(successor) if self.red else -self.get_score(successor)
+        features['rest_food'] = -len(food_list)  # self.get_score(successor)
 
         # Compute distance to the nearest food
-
         if len(food_list) > 0:  # This should always be True, but better safe than sorry
-            my_pos = successor.get_agent_position(self.index)
             min_distance = min([self.get_maze_distance(my_pos, food) for food in food_list])
             features['distance_to_food'] = min_distance
 
-        # How much food have I eaten
+        # current eaten food
         features['eaten_food']= my_state.num_carrying
 
-        enemies = [successor.get_agent_state(i)for i in self.get_opponents(successor)]
-        defenders = [a for a in enemies if not a.is_pacman and a.get_position is not None]
-        features['num_defenders']=len(defenders)
-        features['num_attackers']= 2-len(defenders)
+        # get enemy states
+        enemy_indices = self.get_opponents(successor)
+        enemies = [successor.get_agent_state(i) for i in enemy_indices]
 
-        if len(defenders) > 0:
-            dists = game_state.agent_distances
+        # get defenders who we can see
+        defender_positions = []
+        for enemy in enemies:
+            if not enemy.is_pacman and enemy.get_position() is not None:
+                defender_positions.append(enemy.get_position())
+
+        # Check team data for additional defenders
+        if len(defender_positions) == 0:  # Only use team data if we don't see any defenders directly
+            for enemy_idx in enemy_indices:
+                pos = self.team_communication.enemy_pos_offense[enemy_idx]
+                if pos is not None:
+                    # Check if position is on opponent's side (defender)
+                    """CHANGE"""
+                    # on_opponent_side = (self.red and pos[0] >= self.midpoint) or (not self.red and pos[0] < self.midpoint)
+                    # if on_opponent_side:
+                    defender_positions.append(pos)
+
+        features['num_defenders'] = len(defender_positions)
+        features['num_attackers'] = 2 - len(defender_positions)
+
+        # Calculate distance to defenders
+        if len(defender_positions) > 0:
+            dists = [self.get_maze_distance(my_pos, pos) for pos in defender_positions]
             features['invader_distance'] = min(dists)
-        for a in defenders:
-            if a.scared_timer>0:
-                features['invader_distance']= -features['invader_distance']
-            else:
-                features['invader_distance']= 5*features['invader_distance']
-        if self.red:
-            my_capsules = successor.get_blue_capsules()
+        elif len(defender_positions) == 0:
+
+            # if no defenders visible, check the noisy distance
+            dists = [game_state.agent_distances[i] for i in self.get_opponents(successor)]
+            features['invader_distance'] = min(dists) if dists else 0
+            if features['invader_distance'] <= 0:
+                features['invader_distance'] = 1
+
+        # Check if enemies are scared
+        enemy_scared = False
+        for timer in [a.scared_timer for a in enemies]:
+            if timer >3:
+                enemy_scared = True
+                break
+        # if enemy scared, reward to go closer
+        if enemy_scared:
+            features['invader_distance']= - features['invader_distance']
         else:
-            my_capsules = successor.get_red_capsules()
+            features['invader_distance'] = 5 * features['invader_distance']
+
+        # prevents running into ghosts
+        if len(defender_positions) > 0:
+            min_ghost_distance = min([self.get_maze_distance(my_pos, pos) for pos in defender_positions])
+            if min_ghost_distance < 2 and not enemy_scared:
+                features['ghost_danger'] = 1
+            else:
+                features['ghost_danger'] = 0
+
+        # closest power pellet
+        my_capsules = self.get_capsules(successor)
         if len(my_capsules) >0:
             dists = [self.get_maze_distance(my_pos, p) for p in my_capsules]
             features['powerPellet']= min(dists)
 
-        if action == Directions.STOP: features['stop'] = 1
+        # prevents reversing
         rev = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
         if action == rev: features['reverse'] = 1
 
-        defending_food = self.get_food_you_are_defending(successor).as_list()
-        closest_food = min([self.get_maze_distance(my_pos, food) for food in defending_food])
-        features["return_distance"] = closest_food
+        boundary_x = self.midpoint - (1 if self.red else 0)
+        valid_boundary_points = []
+
+        # Find valid positions along the boundary line
+        for y in range(1, game_state.data.layout.height - 1):
+            # Check if the position is a valid (not a wall)
+            if not game_state.has_wall(boundary_x, y):
+                valid_boundary_points.append((boundary_x, y))
+
+        # If we found valid boundary points, calculate the minimum distance
+        if valid_boundary_points:
+            way_to_border = min([self.get_maze_distance(my_pos, point) for point in valid_boundary_points])
+            features["return_distance"] = way_to_border
+        else:
+            # Fallback if no valid points found
+            features["return_distance"] = abs(my_pos[0] - boundary_x) * 2  # Simple heuristic
+
+
 
         return features
 
@@ -200,38 +349,45 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
     def get_weights(self, game_state, action):
         features = self.get_features(game_state,action)
         if features['eaten_food']<5:
-            return {'successor_score': pow(0.65, 0.5) * 5,
-                'distance_to_food': -pow(0.65, 2),
+            return {'successor_score': 5,
+                    'rest_food': 50,
+                'distance_to_food': -0.4,
                 'eaten_food': 10,
                 'invader_distance': -50,
                 'num_defenders': -10,
                 'num_attackers':10,
                 'powerPellet':-2,
-                'stop': -100,
                 'reverse': -2,
-                'return_distance':-0.01}
-        elif features['eaten_food']> 15:
-            return {'successor_score': pow(0.65, 0.5) * 5,
+                'return_distance':-0.01,
+                'ghost_danger': -1000} #NEW Strongly avoid dangerous ghost positions
+
+        elif features['eaten_food'] > 10:
+            return {'successor_score': 20,
+                    'rest_food': 1,
                     'distance_to_food': -0.002,
                     'eaten_food': 2,
                     'invader_distance': -100,
                     'num_defenders': -40,
                     'num_attackers': 10,
                     'powerPellet': 0,
-                    'stop': -100,
-                    'reverse': -2,
-                    'return_distance': -10}
+                    'reverse': -20,
+                    'return_distance': -30,
+                    'ghost_danger': -2000}  #NEW Strongly avoid dangerous ghost positions
+
         else:
-            return {'successor_score': pow(0.65, 0.5) * 5,
-                    'distance_to_food': -pow(0.65, 2),
+            return {'successor_score': 10,
+                    'rest_food': 30,
+                    'distance_to_food': -0.4,
                     'eaten_food': 2,
                     'invader_distance': -80,
                     'num_defenders': -5,
                     'num_attackers': 10,
                     'powerPellet': -4,
-                    'stop': -100,
-                    'reverse': -2,
-                    'return_distance': -1}
+                    'reverse': -20,
+                    'return_distance': -5,
+                    'ghost_danger': -1500} #NEW Strongly avoid dangerous ghost positions
+
+
 
 
 class DefensiveReflexAgent(ReflexCaptureAgent):
@@ -241,48 +397,123 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
     could be like.  It is not the best or only way to make
     such an agent.
     """
+    def choose_action(self, game_state):
+        """
+        Picks among the actions with the highest Q(s,a).
+        """
+        # update common knowledge
+        self.update_team_data(game_state)
+
+        # middle point
+        boundary_x = self.midpoint - 1 if self.red else self.midpoint + 1
+        # position of agent
+        pos = game_state.get_agent_state(self.index).get_position()
+
+        # reset path counter to take optimal path again when killed
+        if game_state.get_agent_state(self.index).get_position() == self.start:
+            self.path_counter = 0
+        actions = game_state.get_legal_actions(self.index)
+
+        # ignore stop action
+        if Directions.STOP in actions:
+            actions.remove(Directions.STOP)
+
+        # You can profile your evaluation time by uncommenting these lines
+        # start = time.time()
+        values = [self.evaluate(game_state, a) for a in actions]
+
+        # get actions with highest value
+        max_value = max(values)
+        best_actions = [a for a, v in zip(actions, values) if v == max_value]
+
+        # optimal path stops at boundary
+        if pos[0] == boundary_x:
+            self.path_counter = len(self.path) + 1
+
+        # get the actions for the optimal path
+        if self.path and self.path_counter <= len(self.path):
+            action = self.path[self.path_counter][1]
+            if action in actions:
+                self.path_counter += 1
+                return action
+        # choose one of the best actions
+        return random.choice(best_actions)
+
 
     def get_features(self, game_state, action):
+        # initialize dictionary, successor state and position
         features = util.Counter()
         successor = self.get_successor(game_state, action)
-
         my_state = successor.get_agent_state(self.index)
         my_pos = my_state.get_position()
 
-        # Computes whether we're on defense (1) or offense (0)
+        # rewards if agent is defending
         features['on_defense'] = 1
         if my_state.is_pacman: features['on_defense'] = 0
 
-        # Computes distance to invaders we can see
-        enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
-        invaders = [a for a in enemies if a.is_pacman and a.get_position() is not None]
-        features['num_invaders'] = len(invaders)
-        if len(invaders) > 0:
-            dists = [self.get_maze_distance(my_pos, a.get_position()) for a in invaders]
+        # get all the states of enemy agents
+        enemies = [(successor.get_agent_state(i),i) for i in self.get_opponents(successor)]
+        invader_positions = []
+
+        # calculate distance to the middle
+        border_distance = abs(my_pos[0] - self.midpoint)
+
+        # Get enemies we can directly see
+        for enemy,_ in enemies:
+            invader_pos = enemy.get_position()
+            if enemy.is_pacman and invader_pos is not None:
+                invader_positions.append(invader_pos)
+        # enemies others can see on our side when we have no data
+        if len(invader_positions) == 0:
+            for _, enemy_idx in enemies:
+                invader_pos = self.team_communication.enemy_pos_defense[enemy_idx]
+                if invader_pos is not None:
+                    invader_positions.append(invader_pos)
+
+        # get minimal distance to enemy
+        features['num_invaders'] = len(invader_positions)
+        if len(invader_positions) > 0:
+            dists = [self.get_maze_distance(my_pos, pos) for pos in invader_positions]
             features['invader_distance'] = min(dists)
 
-        if action == Directions.STOP: features['stop'] = 1
+
+        # prevents reversing
         rev = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
-        if action == rev: features['reverse'] = 1
-
-
-        # food needs defending (self added)
-        defending_food = self.get_food_you_are_defending(successor).as_list()
-        closest_food =  min([self.get_maze_distance(my_pos, food) for food in defending_food])
-        if len(invaders)>0:
-            features['food_defense'] = closest_food
+        if action == rev:
+            features['reverse'] = 1
         else:
-            features['food_defense'] = 0
+            features['reverse'] = 0
 
-        # hold the line
-        border_line = game_state.data.layout.width // 2
-        boundary_x = border_line - 1 if self.red else border_line
-        border_distance = abs(my_pos[0] - boundary_x)
-        if len(invaders) > 0:
+        # food that defending if there is any left
+        defending_food = self.get_food_you_are_defending(successor).as_list()
+        if defending_food:
+            closest_food =  min([self.get_maze_distance(my_pos, food) for food in defending_food])
+        else:
+            closest_food = 0
+
+        # hold the line and defend food depending on number of invaders
+        if len(invader_positions) > 0:
+            features['food_defense'] = closest_food
             features['near_border'] = 0
         else:
+            features['food_defense'] = 0
             features['near_border'] = border_distance
 
+        # encourages to go closer to the enemy when defending
+        if len(invader_positions) > 0:
+            min_ghost_distance = min([self.get_maze_distance(my_pos, pos) for pos in invader_positions])
+            if min_ghost_distance < 2 and not my_state.is_pacman:
+                features['ghost_danger'] = 2
+            else:
+                features['ghost_danger'] = 1
+
+        # rewards going for the kill
+        features["kills"] = 1 if my_pos in invader_positions else 0
+
+        # changes to offense when scared
+        scary = my_state.scared_timer
+        if scary > 0 :
+            return OffensiveReflexAgent.get_features(self, game_state, action)
         return features
 
     def get_weights(self, game_state, action):
@@ -291,15 +522,12 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
         scary = my_state.scared_timer
         if scary==0:
             return {'num_invaders': -1000,
-                'on_defense': 100,
-                'invader_distance': -100,
-                'stop': -100, 'reverse': -2,
+                'on_defense': 1000,
+                'invader_distance': -200,
+                 'reverse': -2,
                 'food_defense': -10,
-                'near_border' : -30}
+                'near_border' : -30,
+                    'ghost_danger': 1000,
+                    'kills': 100}
         else:
-            return {'num_invaders': 0,
-                'on_defense': 1,
-                'invader_distance': 100,
-                'stop': -100, 'reverse': -2,
-                'food_defense': 0,
-                'near_border' : -5}
+            return OffensiveReflexAgent.get_weights(self, game_state, action)
